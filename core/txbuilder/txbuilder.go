@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"chain/crypto/ed25519/chainkd"
@@ -38,50 +39,15 @@ func Build(ctx context.Context, tx *bc.TxData, actions []Action, maxTime time.Ti
 		local = true
 	}
 
+	var wg sync.WaitGroup
 	var tplSigInsts []*SigningInstruction
 	for i, action := range actions {
-		buildResult, err := action.Build(ctx, maxTime)
-		if err != nil {
-			return nil, errors.WithDetailf(err, "invalid action %d", i)
-		}
+		go build1(ctx, i, action, maxTime, wg.Done)
+	}
 
-		for _, in := range buildResult.Inputs {
-			if in.Amount() > math.MaxInt64 {
-				return nil, errors.WithDetailf(ErrBadAmount, "bad amount '%d' for action %d: exceeds maximum value 2^63", in.Amount(), i)
-			}
-		}
-		for _, out := range buildResult.Outputs {
-			if out.Amount > math.MaxInt64 {
-				return nil, errors.WithDetailf(ErrBadAmount, "bad amount '%d' for action %d: exceeds maximum value 2^63", out.Amount, i)
-			}
-		}
-
-		if len(buildResult.Inputs) != len(buildResult.SigningInstructions) {
-			// This would only happen from a bug in our system
-			return nil, errors.Wrap(fmt.Errorf("%T returned different number of inputs and signing instructions", action))
-		}
-
-		for i := range buildResult.Inputs {
-			buildResult.SigningInstructions[i].Position = len(tx.Inputs)
-			tplSigInsts = append(tplSigInsts, buildResult.SigningInstructions[i])
-			tx.Inputs = append(tx.Inputs, buildResult.Inputs[i])
-		}
-
-		tx.Outputs = append(tx.Outputs, buildResult.Outputs...)
-
-		if len(buildResult.ReferenceData) > 0 {
-			if len(tx.ReferenceData) != 0 && !bytes.Equal(tx.ReferenceData, buildResult.ReferenceData) {
-				// There can be only one! ...caller that sets reference data
-				return nil, errors.Wrap(ErrBadRefData)
-			}
-			tx.ReferenceData = buildResult.ReferenceData
-		}
-
-		if buildResult.MinTimeMS > 0 {
-			if buildResult.MinTimeMS > tx.MinTime {
-				tx.MinTime = buildResult.MinTimeMS
-			}
-		}
+	wg.Wait()
+	if anyErrors() {
+		return nil, err
 	}
 
 	err := checkBlankCheck(tx)
@@ -106,6 +72,52 @@ func Build(ctx context.Context, tx *bc.TxData, actions []Action, maxTime time.Ti
 		Local:               local,
 	}
 	return tpl, nil
+}
+
+func build1(ctx context.Context, i int, action Action, maxTime time.Time, done func()) {
+	defer done()
+	buildResult, err := action.Build(ctx, maxTime)
+	if err != nil {
+		return nil, errors.WithDetailf(err, "invalid action %d", i)
+	}
+
+	for _, in := range buildResult.Inputs {
+		if in.Amount() > math.MaxInt64 {
+			return nil, errors.WithDetailf(ErrBadAmount, "bad amount '%d' for action %d: exceeds maximum value 2^63", in.Amount(), i)
+		}
+	}
+	for _, out := range buildResult.Outputs {
+		if out.Amount > math.MaxInt64 {
+			return nil, errors.WithDetailf(ErrBadAmount, "bad amount '%d' for action %d: exceeds maximum value 2^63", out.Amount, i)
+		}
+	}
+
+	if len(buildResult.Inputs) != len(buildResult.SigningInstructions) {
+		// This would only happen from a bug in our system
+		return nil, errors.Wrap(fmt.Errorf("%T returned different number of inputs and signing instructions", action))
+	}
+
+	for i := range buildResult.Inputs {
+		buildResult.SigningInstructions[i].Position = len(tx.Inputs)
+		tplSigInsts = append(tplSigInsts, buildResult.SigningInstructions[i])
+		tx.Inputs = append(tx.Inputs, buildResult.Inputs[i])
+	}
+
+	tx.Outputs = append(tx.Outputs, buildResult.Outputs...)
+
+	if len(buildResult.ReferenceData) > 0 {
+		if len(tx.ReferenceData) != 0 && !bytes.Equal(tx.ReferenceData, buildResult.ReferenceData) {
+			// There can be only one! ...caller that sets reference data
+			return nil, errors.Wrap(ErrBadRefData)
+		}
+		tx.ReferenceData = buildResult.ReferenceData
+	}
+
+	if buildResult.MinTimeMS > 0 {
+		if buildResult.MinTimeMS > tx.MinTime {
+			tx.MinTime = buildResult.MinTimeMS
+		}
+	}
 }
 
 // KeyIDs produces KeyIDs from a list of xpubs and a derivation path
